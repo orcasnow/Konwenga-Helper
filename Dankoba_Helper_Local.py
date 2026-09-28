@@ -41,6 +41,74 @@ class _QueueLogHandler(logging.Handler):
             self.handleError(record)
 
 
+def _fill_match_details(values: dict, report: core.RunReport) -> None:
+    """選択大会の日程から試合情報を空欄に補う。"""
+    network = core.build_network_config()
+    fetcher = core.PageFetcher(core.build_session(network), network, report)
+    lookup = core.JLeagueScheduleLookup(
+        fetcher,
+        report,
+        render_on_miss=bool(core.USE_PLAYWRIGHT_FALLBACK),
+    )
+    competition = core.competition_type(values["competition_type"])
+    core.logger.info("%s の日程から %s vs %s の試合を検索します",
+                     competition.name, values["my_team"], values["opponent_team"])
+    try:
+        info = lookup.resolve(values["my_team"], values["opponent_team"], competition)
+    except Exception as exc:
+        core.logger.exception("大会日程からの試合情報取得に失敗しました")
+        report.warn(f"大会日程からの自動取得に失敗しました: {exc}")
+        return
+
+    if info is None:
+        core.logger.info("日程から試合を特定できませんでした。入力済みの値で続けます")
+        return
+
+    discovered = {
+        "round_label": info.round_label,
+        "kickoff_date": info.kickoff_date,
+        "kickoff_time": info.kickoff_time,
+        "venue_name": info.venue_name,
+        "venue_address": info.venue_address,
+        "venue_map_url": info.venue_map_url,
+        "broadcast": info.broadcast,
+    }
+    if info.home_team:
+        discovered["home_or_away"] = (
+            "ホーム"
+            if core.JLeagueScheduleLookup._loose_match(info.home_team, values["my_team"])
+            else "アウェイ"
+        )
+    filled = []
+    for key, value in discovered.items():
+        if value and not str(values.get(key, "")).strip():
+            values[key] = str(value)
+            filled.append(key)
+    core.logger.info("日程から取得した値を反映しました: %s",
+                     "、".join(filled) if filled else "入力済みの値を維持しました")
+    core.logger.info("試合情報の取得元: %s", info.url)
+
+    if not core.AUTO_FILL_WEATHER or str(values.get("weather_text", "")).strip():
+        return
+    try:
+        forecast = core.TenkiJpForecast(fetcher, report).resolve(
+            values.get("venue_name", ""),
+            values.get("venue_address", ""),
+            values.get("kickoff_date", ""),
+            values.get("kickoff_time", ""),
+        )
+    except Exception as exc:
+        core.logger.exception("天気の自動取得に失敗しました")
+        report.warn(f"天気の自動取得に失敗しました: {exc}")
+        return
+    if forecast is None:
+        return
+    if forecast.text and not str(values.get("weather_text", "")).strip():
+        values["weather_text"] = forecast.text
+    if forecast.url and not str(values.get("weather_url", "")).strip():
+        values["weather_url"] = forecast.url
+
+
 class ScrollableFrame(ttk.Frame):
     def __init__(self, master: tk.Misc, **kwargs):
         super().__init__(master, **kwargs)
@@ -90,10 +158,21 @@ class DankobaLocalApp:
         self.vars[key] = value
         return value
 
-    def _entry(self, parent: tk.Misc, label: str, key: str, default: str = "", width: int = 44):
+    def _entry(
+        self,
+        parent: tk.Misc,
+        label: str,
+        key: str,
+        default: str = "",
+        width: int = 44,
+        required: bool = False,
+    ):
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=3)
-        ttk.Label(row, text=label, width=20).pack(side="left", anchor="nw")
+        label_options = {"text": f"{label} ＊" if required else label, "width": 20}
+        if required:
+            label_options["foreground"] = "#b3261e"
+        ttk.Label(row, **label_options).pack(side="left", anchor="nw")
         entry = ttk.Entry(row, textvariable=self._var(key, default), width=width)
         entry.pack(side="left", fill="x", expand=True)
         return entry
@@ -109,7 +188,7 @@ class DankobaLocalApp:
     def _build_ui(self):
         top = ttk.LabelFrame(self.root, text="大会種別", padding=(12, 7))
         top.pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Label(top, text="この記事の大会:").pack(side="left", padx=(0, 12))
+        ttk.Label(top, text="この記事の大会 ＊必須", foreground="#b3261e").pack(side="left", padx=(0, 12))
         for item in core.COMPETITION_TYPES:
             ttk.Radiobutton(
                 top, text=item.name, value=item.name, variable=self.competition_var
@@ -138,29 +217,29 @@ class DankobaLocalApp:
     def _build_match_tab(self, parent: tk.Misc):
         ttk.Label(
             parent,
-            text="試合の日時や会場は手入力できます。Jリーグ公式の情報を必須にせず、空欄の項目は記事内に入力用のメモを残します。",
+            text="＊は必須項目です。大会と両クラブから今後の試合日程を検索し、日時・会場・中継などを空欄に補います。取得結果を確認してから Markdown を作成します。",
             wraplength=980,
         ).pack(anchor="w", pady=(0, 10))
-        self._entry(parent, "記事番号", "serial_number")
+        self._entry(parent, "記事番号", "serial_number", required=True)
         self._entry(parent, "シーズン", "season", f"{date.today().year}/{str(date.today().year + 1)[-2:]}")
         self._entry(parent, "大会名（任意）", "competition")
         self._entry(parent, "節・ラウンド", "round_label")
-        self._entry(parent, "自チーム", "my_team")
-        self._entry(parent, "対戦相手", "opponent_team")
+        self._entry(parent, "自チーム", "my_team", required=True)
+        self._entry(parent, "対戦相手", "opponent_team", required=True)
         self._entry(parent, "対戦相手のハッシュタグ", "opponent_hashtag", width=30)
 
         home_row = ttk.Frame(parent)
         home_row.pack(fill="x", pady=5)
         ttk.Label(home_row, text="自チームの開催区分", width=20).pack(side="left")
-        self._var("home_or_away", "ホーム")
+        self._var("home_or_away", "")
         ttk.Radiobutton(home_row, text="ホーム", value="ホーム", variable=self.vars["home_or_away"]).pack(side="left", padx=8)
         ttk.Radiobutton(home_row, text="アウェイ", value="アウェイ", variable=self.vars["home_or_away"]).pack(side="left", padx=8)
 
         self._entry(parent, "キックオフ日", "kickoff_date", "", width=20)
         ttk.Label(parent, text="日付は YYYY-MM-DD 形式で入力してください。", foreground="#666").pack(anchor="w", padx=(160, 0))
         self._entry(parent, "キックオフ時刻", "kickoff_time", "", width=20)
-        self._entry(parent, "自チームの布陣", "my_team_formation", width=20)
-        self._entry(parent, "相手の布陣", "opponent_formation", width=20)
+        self._entry(parent, "自チームの布陣", "my_team_formation", width=20, required=True)
+        self._entry(parent, "相手の布陣", "opponent_formation", width=20, required=True)
         self._entry(parent, "会場", "venue_name")
         self._entry(parent, "会場住所", "venue_address")
         self._entry(parent, "地図URL", "venue_map_url")
@@ -269,26 +348,97 @@ class DankobaLocalApp:
 
     def _start_generation(self):
         values = self._snapshot()
-        if not values.get("my_team") or not values.get("opponent_team"):
-            messagebox.showwarning("入力を確認してください", "自チームと対戦相手を入力してください。")
-            return
-        default_name = self._suggest_filename(values)
-        output_value = filedialog.asksaveasfilename(
-            title="Markdown の保存先",
-            initialfile=default_name,
-            defaultextension=".md",
-            filetypes=[("Markdown", "*.md")],
+        required_fields = (
+            ("serial_number", "記事番号"),
+            ("my_team", "自チーム"),
+            ("opponent_team", "対戦相手"),
+            ("my_team_formation", "自チームの布陣"),
+            ("opponent_formation", "相手の布陣"),
         )
-        if not output_value:
+        missing = [label for key, label in required_fields if not values.get(key, "").strip()]
+        valid_competitions = {item.name for item in core.COMPETITION_TYPES}
+        if values.get("competition_type") not in valid_competitions:
+            missing.insert(0, "大会種別")
+        if missing:
+            messagebox.showwarning(
+                "必須項目を入力してください",
+                "次の必須項目が未入力です:\n\n・" + "\n・".join(missing),
+                parent=self.root,
+            )
             return
-        output_path = Path(output_value)
-        if output_path.suffix.lower() != ".md":
-            output_path = output_path.with_suffix(".md")
-        values["output_path"] = output_path
         self.generate_button.configure(state="disabled")
-        self.status_var.set("Markdown を準備しています…")
-        self._append_log("作成を開始しました。ネットワーク取得中もウィンドウは操作できます。")
+        self.status_var.set("大会日程から試合情報を取得しています…")
+        self._append_log("作成を開始しました。大会日程を検索します。")
         threading.Thread(target=self._generate_worker, args=(values,), daemon=True).start()
+
+    def _apply_review_values(self, values: dict) -> None:
+        """自動取得値を入力欄にも反映し、確認後に手修正できるようにする。"""
+        for key, variable in self.vars.items():
+            if key in values:
+                variable.set(str(values.get(key, "")))
+
+    def _review_match_info(self, values: dict, response: dict, ready: threading.Event) -> None:
+        """自動取得結果を一覧し、確認後に保存先を選んでもらう。"""
+        try:
+            self._apply_review_values(values)
+            config = response["config"]
+            fields = (
+                ("選択した大会種別", values.get("competition_type", "")),
+                ("記事に載せる大会名", config.competition),
+                ("シーズン", config.season),
+                ("記事番号", values.get("serial_number", "")),
+                ("自チーム", config.my_team),
+                ("対戦相手", config.opponent_team),
+                ("対戦相手のハッシュタグ", values.get("opponent_hashtag", "")),
+                ("自チームの布陣", config.my_team_formation),
+                ("相手の布陣", config.opponent_formation),
+                ("節・ラウンド", values.get("round_label", "")),
+                ("開催区分", values.get("home_or_away", "")),
+                ("キックオフ", " ".join(
+                    value for value in (values.get("kickoff_date", ""), values.get("kickoff_time", ""))
+                    if value
+                )),
+                ("会場", values.get("venue_name", "")),
+                ("住所", values.get("venue_address", "")),
+                ("地図URL", values.get("venue_map_url", "")),
+                ("中継", values.get("broadcast", "")),
+                ("天気", values.get("weather_text", "")),
+                ("天気URL", values.get("weather_url", "")),
+            )
+            lines = [
+                f"{label}: {value or '（未取得・必要なら試合情報タブで入力）'}"
+                for label, value in fields
+            ]
+            lines.extend(("", "この内容で Markdown を作成しますか？"))
+            accepted = messagebox.askyesno(
+                "試合情報の確認",
+                "\n".join(lines),
+                parent=self.root,
+            )
+            if not accepted:
+                return
+
+            output_value = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Markdown の保存先",
+                initialfile=self._suggest_filename(values),
+                defaultextension=".md",
+                filetypes=[("Markdown", "*.md")],
+            )
+            if not output_value:
+                return
+            output_path = Path(output_value)
+            if output_path.suffix.lower() != ".md":
+                output_path = output_path.with_suffix(".md")
+            response["output_path"] = output_path
+            response["accepted"] = True
+            self.status_var.set("Markdown を作成しています…")
+            self._append_log("試合情報を確認しました。Markdown を作成します。")
+        except Exception as exc:
+            core.logger.exception("試合情報の確認ダイアログを表示できませんでした")
+            messagebox.showerror("確認画面のエラー", str(exc), parent=self.root)
+        finally:
+            ready.set()
 
     @staticmethod
     def _safe_name(value: str) -> str:
@@ -322,7 +472,14 @@ class DankobaLocalApp:
             core.PLAYWRIGHT_CHANNEL = ""
             core.USE_PLAYWRIGHT_FALLBACK = bool(values["playwright"])
             core.CLUB_LINKS_JSON = ""
+            core.MY_TEAM = values["my_team"]
+            core.OPPONENT_TEAM = values["opponent_team"]
+            core.SERIAL_NUMBER = values["serial_number"]
+            core.MY_TEAM_FORMATION = values["my_team_formation"]
+            core.OPPONENT_FORMATION = values["opponent_formation"]
             core.apply_extra_aliases(report)
+
+            _fill_match_details(values, report)
 
             config = core.build_preview_config(
                 serial_number=values.get("serial_number", ""),
@@ -350,6 +507,10 @@ class DankobaLocalApp:
                 drive_folder_name="",
                 report=report,
             )
+            if not str(values.get("competition", "")).strip():
+                values["competition"] = config.competition
+            if not str(values.get("opponent_hashtag", "")).strip():
+                values["opponent_hashtag"] = config.opponent_hashtag
             core.logger.info("試合情報を確定しました: %s", config.document_title)
             core.logger.info(
                 "対戦カード: %s vs %s / %s %s / %s",
@@ -359,6 +520,15 @@ class DankobaLocalApp:
                 config.kickoff_time or "時刻未設定",
                 config.venue_name or "会場未設定",
             )
+
+            review_response = {"config": config, "accepted": False}
+            review_ready = threading.Event()
+            self.events.put(("review", values, review_response, review_ready))
+            review_ready.wait()
+            if not review_response["accepted"]:
+                self.events.put(("cancelled",))
+                return
+            values["output_path"] = review_response["output_path"]
 
             club_links = []
             if values["collect_club_links"]:
@@ -594,6 +764,15 @@ class DankobaLocalApp:
                 event = self.events.get_nowait()
                 if event[0] == "log":
                     self._append_log(event[1])
+                elif event[0] == "review":
+                    _, values, response, ready = event
+                    self.status_var.set("取得した試合情報を確認してください")
+                    self._append_log("大会日程から取得した内容を確認します。")
+                    self._review_match_info(values, response, ready)
+                elif event[0] == "cancelled":
+                    self.status_var.set("作成をキャンセルしました")
+                    self._append_log("作成をキャンセルしました。入力内容はフォームに残っています。")
+                    self.generate_button.configure(state="normal")
                 elif event[0] == "complete":
                     _, path, warnings, image_count = event
                     self.status_var.set(f"Markdown を保存しました: {path}")

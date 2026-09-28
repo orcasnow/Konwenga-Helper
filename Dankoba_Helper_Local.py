@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import queue
+import logging
 import re
 import shutil
 import threading
@@ -24,6 +25,20 @@ except ImportError as exc:
 
 APP_VERSION = "1.0.0"
 IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+
+
+class _QueueLogHandler(logging.Handler):
+    """ワーカースレッドのログをGUIの処理ログにも流す。"""
+
+    def __init__(self, events: queue.Queue):
+        super().__init__(logging.INFO)
+        self.events = events
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.events.put(("log", self.format(record)))
+        except Exception:
+            self.handleError(record)
 
 
 class ScrollableFrame(ttk.Frame):
@@ -288,7 +303,18 @@ class DankobaLocalApp:
     def _generate_worker(self, values: dict):
         report = core.RunReport()
         copied_images: list[tuple[str, str]] = []
+        log_handler = _QueueLogHandler(self.events)
+        log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        core.logger.addHandler(log_handler)
         try:
+            core.logger.info("Dankoba Helper Local Ver.%s", APP_VERSION)
+            core.logger.info("Markdown作成を開始します")
+            core.logger.info(
+                "設定: 公式リンク=%s、順位表・ハイライト=%s、Playwright=%s",
+                "有効" if values["collect_club_links"] else "無効",
+                "有効" if values["collect_league_data"] else "無効",
+                "有効" if values["playwright"] else "無効",
+            )
             core.COMPETITION_TYPE = values["competition_type"]
             core.RESPECT_ROBOTS_TXT = True
             core.REQUEST_MIN_INTERVAL_SEC = 1.0
@@ -324,9 +350,19 @@ class DankobaLocalApp:
                 drive_folder_name="",
                 report=report,
             )
+            core.logger.info("試合情報を確定しました: %s", config.document_title)
+            core.logger.info(
+                "対戦カード: %s vs %s / %s %s / %s",
+                config.home_team,
+                config.away_team,
+                config.kickoff_date.isoformat() if config.kickoff_date else "日付未設定",
+                config.kickoff_time or "時刻未設定",
+                config.venue_name or "会場未設定",
+            )
 
             club_links = []
             if values["collect_club_links"]:
+                core.logger.info("クラブ公式サイトのリンク収集を開始します")
                 try:
                     club_links = core.collect_club_site_links(
                         config.home_team,
@@ -338,6 +374,7 @@ class DankobaLocalApp:
                     )
                     found_count = sum(1 for link in club_links if getattr(link, "found", False))
                     report.ok("クラブ公式サイト", f"リンク {found_count}件")
+                    core.logger.info("クラブ公式サイトのリンク収集が完了しました: %s件", found_count)
                 except Exception as exc:
                     report.warn(f"クラブ公式サイトのリンク取得に失敗しました: {exc}")
                     club_links = []
@@ -346,24 +383,31 @@ class DankobaLocalApp:
             highlight = None
             if values["collect_league_data"]:
                 try:
+                    core.logger.info("Jリーグ順位表を取得します: %s", config.my_team)
                     standings = core.fetch_standings(config.my_team, report)
+                    core.logger.info("Jリーグ順位表の取得が完了しました")
                 except Exception as exc:
                     report.warn(f"順位表の取得に失敗しました: {exc}")
                 try:
+                    core.logger.info("対戦相手の前節ハイライトを検索します: %s", config.opponent_team)
                     highlight = core.fetch_previous_highlight(config.opponent_team, config.season, report)
+                    core.logger.info("前節ハイライトの検索が完了しました")
                 except Exception as exc:
                     report.warn(f"前節ハイライトの取得に失敗しました: {exc}")
 
+            core.logger.info("Markdownの構成を組み立てます")
             structure = core.build_document_structure(
                 config, club_links=club_links, standings=standings, highlight=highlight
             )
             self._apply_article_text(structure, values)
             self._append_reference_links(structure, values.get("reference_links", ""))
+            core.logger.info("入力内容と参考リンクを反映しました")
 
             output_path: Path = values["output_path"]
             output_path.parent.mkdir(parents=True, exist_ok=True)
             for source in values.get("images", []):
                 try:
+                    core.logger.info("画像を添付します: %s", source)
                     attached = self._copy_image(source, output_path.parent / "attachments")
                     relative = "attachments/" + quote(attached.name)
                     copied_images.append((source.name, relative))
@@ -371,10 +415,15 @@ class DankobaLocalApp:
                     report.warn(f"画像を添付できませんでした（{source.name}）: {exc}")
 
             markdown = self._render_markdown(structure, copied_images)
+            core.logger.info("Markdownを書き込みます: %s", output_path)
             output_path.write_text(markdown, encoding="utf-8")
+            core.logger.info("Markdownの書き込みが完了しました (%s文字)", len(markdown))
             self.events.put(("complete", str(output_path), report.warnings, len(copied_images)))
         except Exception as exc:
+            core.logger.exception("Markdown作成中にエラーが発生しました")
             self.events.put(("error", str(exc)))
+        finally:
+            core.logger.removeHandler(log_handler)
 
     @staticmethod
     def _copy_image(source: Path, destination: Path) -> Path:
@@ -543,7 +592,9 @@ class DankobaLocalApp:
         try:
             while True:
                 event = self.events.get_nowait()
-                if event[0] == "complete":
+                if event[0] == "log":
+                    self._append_log(event[1])
+                elif event[0] == "complete":
                     _, path, warnings, image_count = event
                     self.status_var.set(f"Markdown を保存しました: {path}")
                     self._append_log(f"保存先: {path}")

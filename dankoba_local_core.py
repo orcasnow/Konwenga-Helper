@@ -352,6 +352,10 @@ class HostThrottle:
             elapsed = time.monotonic() - previous
             sleep_sec = self.min_interval_sec - elapsed
             if sleep_sec > 0:
+                logger.info(
+                    "同じサイトへのアクセス間隔を空けるため %.1f秒待機します: %s",
+                    sleep_sec, host,
+                )
                 time.sleep(sleep_sec)
             self._last_access[host] = time.monotonic()
 
@@ -382,10 +386,13 @@ class RobotsPolicy:
                 return self._parsers[origin]
         parser: Optional[robotparser.RobotFileParser] = None
         try:
-            response = self.session.get(urljoin(origin, "/robots.txt"), timeout=self.network.timeout_sec)
+            robots_url = urljoin(origin, "/robots.txt")
+            logger.info("robots.txt を確認します: %s", robots_url)
+            response = self.session.get(robots_url, timeout=self.network.timeout_sec)
             if response.status_code == 200:
                 parser = robotparser.RobotFileParser()
                 parser.parse(decode_response_text(response, self.network).splitlines())
+                logger.info("robots.txt を読み込みました: %s", origin)
             else:
                 logger.debug("robots.txt が見つかりません (HTTP %s): %s", response.status_code, origin)
         except Exception:
@@ -512,11 +519,12 @@ class PageFetcher:
         url, original_url = self._prefer_https(url), url
         cache_key = f"{url}|{wait_selector}"
         if cache_key in self._cache:
-            logger.debug("取得済みのページを使います: %s", url)
+            logger.info("取得済みのページを再利用します: %s", url)
             return self._cache[cache_key]
         if not self.robots.is_allowed(url):
             self._warn("robots.txt で許可されていないため取得しません: %s", url)
             return None
+        logger.info("ページ取得を開始します: %s", url)
         host = urlparse(url).netloc.lower()
         if not force_render and use_playwright_fallback and host in self._render_hosts:
             logger.info("このサイトは静的に取れないので、最初からブラウザで開きます: %s", url)
@@ -537,6 +545,10 @@ class PageFetcher:
             html = decode_response_text(response, self.network)
             result = FetchResult(url=url, html=html, source="静的HTML",
                                  status_code=response.status_code, soup=parse_html(html))
+            logger.info(
+                "静的HTMLを取得しました: %s (HTTP %s、%s文字)",
+                url, response.status_code, len(html),
+            )
         except requests.HTTPError as error:
             status = getattr(getattr(error, "response", None), "status_code", "不明")
             if status in (401, 403, 406, 429):
@@ -598,6 +610,7 @@ class PageFetcher:
         last_error: Optional[Exception] = None
         for attempt in (1, 2):
             try:
+                logger.info("Playwrightでページを開きます (%s/2): %s", attempt, url)
                 html = run_in_notebook(self._render_async(url, wait_selector))
             except ModuleNotFoundError:
                 self._warn(
@@ -612,7 +625,9 @@ class PageFetcher:
                     time.sleep(2)
                 continue
             if not html:
+                logger.warning("Playwrightから本文を取得できませんでした: %s", url)
                 return None
+            logger.info("Playwrightでページを取得しました: %s (%s文字)", url, len(html))
             return FetchResult(url=url, html=html, source="Playwright", soup=parse_html(html))
         self._warn(
             "ブラウザでもページを取得できませんでした: %s（%s: %s）",
@@ -3653,23 +3668,34 @@ class ClubSiteLinkFinder:
         tokens: Sequence[str],
         venue_tokens: Sequence[str] = (),
     ) -> FoundLink:
+        logger.info("リンク種別「%s」を探します: %s", target.category, club_name)
         candidates = self._candidates(pages, target)
         if not candidates:
+            logger.info("リンク種別「%s」の候補は見つかりませんでした: %s", target.category, club_name)
             return FoundLink(
                 category=target.category, club=club_name,
                 note="公式サイトのトップに該当するリンクがありませんでした",
             )
 
         if target.venue_specific:
-            return self._resolve_venue_target(club_name, target, candidates, venue_tokens)
+            result = self._resolve_venue_target(club_name, target, candidates, venue_tokens)
+            logger.info(
+                "リンク種別「%s」の結果: %s%s",
+                target.category,
+                result.url or "未発見",
+                f"（{result.note}）" if result.note else "",
+            )
+            return result
 
         if not target.match_specific:
             label, url = candidates[0]
+            logger.info("リンク種別「%s」を選びました: %s (%s)", target.category, label, url)
             return FoundLink(target.category, club_name, label, url)
 
         # 試合ごとのページは、日付や相手名を含むものを優先する
         best_score, label, url = self._best(candidates, tokens, target)
         if best_score > 0:
+            logger.info("リンク種別「%s」を選びました: %s (%s)", target.category, label, url)
             return FoundLink(target.category, club_name, label, url)
 
         # トップで当たらなければ、一覧を1回だけ開いて中を探す
@@ -3687,7 +3713,9 @@ class ClubSiteLinkFinder:
             self._candidates([index_page], target), tokens, target
         )
         if inner_score > 0:
+            logger.info("一覧から「%s」のリンクを見つけました: %s (%s)", target.category, inner_label, inner_url)
             return FoundLink(target.category, club_name, inner_label, inner_url)
+        logger.info("一覧内でも「%s」の試合別リンクは見つかりませんでした", target.category)
         return FoundLink(
             category=target.category, club=club_name, label=index_label, url=index_url,
             note="この試合のページは特定できず、一覧のURLを載せています",
@@ -3789,6 +3817,7 @@ class ClubSiteLinkFinder:
         venue_name: str = "",
         categories: Optional[Sequence[str]] = None,
     ) -> List[FoundLink]:
+        logger.info("クラブ公式リンクの収集を開始します: %s", club_name)
         club = lookup_club(club_name, self.report)
         if club is None or not club.official_site_url:
             return self._all_missing(club_name, "クラブ情報に公式サイトURLがありません", categories)
@@ -3864,6 +3893,13 @@ class ClubSiteLinkFinder:
                     excerpt=goods_excerpt,
                 )
             results.append(link)
+            logger.info(
+                "リンク種別「%s」の結果: %s%s",
+                target.category,
+                link.url or "未発見",
+                f"（{link.note}）" if link.note else "",
+            )
+        logger.info("クラブ公式リンクの収集が完了しました: %s", club.canonical_name)
         return self._apply_overrides(club.canonical_name, results)
 
     @staticmethod
@@ -3906,6 +3942,7 @@ def collect_club_site_links(
     開催地がクラブの常設ホームでない場合（国立開催など）、クラブ公式の
     アクセス案内はそのままでは使えない。その場合は Jリーグ公式から取れている
     会場の地図URLを控えとして添える。"""
+    logger.info("両クラブの公式サイトからリンクを収集します: %s / %s", home_team, away_team)
     network = build_network_config()
     finder = ClubSiteLinkFinder(PageFetcher(build_session(network), network, report), report)
 
@@ -3925,6 +3962,7 @@ def collect_club_site_links(
             label="Googleマップ（Jリーグ公式より）", url=venue_map_url,
             note="クラブ公式に開催地のアクセス案内が見つからなかったため、地図を代わりに載せています",
         ))
+    logger.info("クラブ公式サイトからのリンク収集が完了しました: %s件", len(results))
     return results
 
 

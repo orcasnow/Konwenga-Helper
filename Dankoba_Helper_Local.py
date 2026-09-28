@@ -1,0 +1,580 @@
+# -*- coding: utf-8 -*-
+"""Dankoba Helper local GUI. Runs independently of Google Colab and Google Docs."""
+
+from __future__ import annotations
+
+import queue
+import re
+import shutil
+import threading
+import tkinter as tk
+from datetime import date
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import quote
+
+try:
+    import dankoba_local_core as core
+except ImportError as exc:
+    raise SystemExit(
+        "ローカル用依存パッケージを読み込めません。README_LOCAL.md の手順で"
+        f"依存関係をインストールしてください。\n\n詳細: {exc}"
+    ) from exc
+
+
+APP_VERSION = "1.0.0"
+IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+
+
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, master: tk.Misc, **kwargs):
+        super().__init__(master, **kwargs)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.body = ttk.Frame(self.canvas, padding=12)
+        self.window_id = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.body.bind("<Configure>", self._update_scrollregion)
+        self.canvas.bind("<Configure>", self._resize_body)
+        self.canvas.bind_all("<MouseWheel>", self._mousewheel)
+
+    def _update_scrollregion(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _resize_body(self, event):
+        self.canvas.itemconfigure(self.window_id, width=event.width)
+
+    def _mousewheel(self, event):
+        if self.winfo_exists() and self.winfo_ismapped():
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+
+class DankobaLocalApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"Dankoba Helper Local Ver.{APP_VERSION}")
+        self.root.geometry("1120x860")
+        self.root.minsize(900, 680)
+        self.vars: dict[str, tk.StringVar] = {}
+        self.texts: dict[str, tk.Text] = {}
+        self.selected_images: list[Path] = []
+        self.events: queue.Queue = queue.Queue()
+        self.generate_button: ttk.Button | None = None
+        self.status_var = tk.StringVar(value="入力して Markdown を作成してください")
+        self.competition_var = tk.StringVar(value="J1")
+        self.collect_club_links_var = tk.BooleanVar(value=True)
+        self.collect_league_data_var = tk.BooleanVar(value=False)
+        self.playwright_var = tk.BooleanVar(value=True)
+        self._build_ui()
+        self.root.after(150, self._poll_events)
+
+    def _var(self, key: str, default: str = "") -> tk.StringVar:
+        value = tk.StringVar(value=default)
+        self.vars[key] = value
+        return value
+
+    def _entry(self, parent: tk.Misc, label: str, key: str, default: str = "", width: int = 44):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text=label, width=20).pack(side="left", anchor="nw")
+        entry = ttk.Entry(row, textvariable=self._var(key, default), width=width)
+        entry.pack(side="left", fill="x", expand=True)
+        return entry
+
+    def _text(self, parent: tk.Misc, label: str, key: str, height: int = 4):
+        box = ttk.LabelFrame(parent, text=label, padding=6)
+        box.pack(fill="x", expand=False, pady=5)
+        text = tk.Text(box, height=height, wrap="word", undo=True)
+        text.pack(fill="x", expand=True)
+        self.texts[key] = text
+        return text
+
+    def _build_ui(self):
+        top = ttk.LabelFrame(self.root, text="大会種別", padding=(12, 7))
+        top.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(top, text="この記事の大会:").pack(side="left", padx=(0, 12))
+        for item in core.COMPETITION_TYPES:
+            ttk.Radiobutton(
+                top, text=item.name, value=item.name, variable=self.competition_var
+            ).pack(side="left", padx=7)
+
+        tabs = ttk.Notebook(self.root)
+        tabs.pack(fill="both", expand=True, padx=10, pady=6)
+        match_tab = ScrollableFrame(tabs)
+        article_tab = ScrollableFrame(tabs)
+        output_tab = ScrollableFrame(tabs)
+        tabs.add(match_tab, text="試合情報")
+        tabs.add(article_tab, text="記事本文")
+        tabs.add(output_tab, text="参考リンク・画像・取得設定")
+        self._build_match_tab(match_tab.body)
+        self._build_article_tab(article_tab.body)
+        self._build_output_tab(output_tab.body)
+
+        footer = ttk.Frame(self.root, padding=(12, 5, 12, 10))
+        footer.pack(fill="x")
+        self.generate_button = ttk.Button(
+            footer, text="Markdown を作成", command=self._start_generation
+        )
+        self.generate_button.pack(side="right")
+        ttk.Label(footer, textvariable=self.status_var).pack(side="left", fill="x", expand=True)
+
+    def _build_match_tab(self, parent: tk.Misc):
+        ttk.Label(
+            parent,
+            text="試合の日時や会場は手入力できます。Jリーグ公式の情報を必須にせず、空欄の項目は記事内に入力用のメモを残します。",
+            wraplength=980,
+        ).pack(anchor="w", pady=(0, 10))
+        self._entry(parent, "記事番号", "serial_number")
+        self._entry(parent, "シーズン", "season", f"{date.today().year}/{str(date.today().year + 1)[-2:]}")
+        self._entry(parent, "大会名（任意）", "competition")
+        self._entry(parent, "節・ラウンド", "round_label")
+        self._entry(parent, "自チーム", "my_team")
+        self._entry(parent, "対戦相手", "opponent_team")
+        self._entry(parent, "対戦相手のハッシュタグ", "opponent_hashtag", width=30)
+
+        home_row = ttk.Frame(parent)
+        home_row.pack(fill="x", pady=5)
+        ttk.Label(home_row, text="自チームの開催区分", width=20).pack(side="left")
+        self._var("home_or_away", "ホーム")
+        ttk.Radiobutton(home_row, text="ホーム", value="ホーム", variable=self.vars["home_or_away"]).pack(side="left", padx=8)
+        ttk.Radiobutton(home_row, text="アウェイ", value="アウェイ", variable=self.vars["home_or_away"]).pack(side="left", padx=8)
+
+        self._entry(parent, "キックオフ日", "kickoff_date", "", width=20)
+        ttk.Label(parent, text="日付は YYYY-MM-DD 形式で入力してください。", foreground="#666").pack(anchor="w", padx=(160, 0))
+        self._entry(parent, "キックオフ時刻", "kickoff_time", "", width=20)
+        self._entry(parent, "自チームの布陣", "my_team_formation", width=20)
+        self._entry(parent, "相手の布陣", "opponent_formation", width=20)
+        self._entry(parent, "会場", "venue_name")
+        self._entry(parent, "会場住所", "venue_address")
+        self._entry(parent, "地図URL", "venue_map_url")
+        self._entry(parent, "中継", "broadcast")
+        self._entry(parent, "天気のメモ", "weather_text")
+        self._entry(parent, "天気URL", "weather_url")
+
+    def _build_article_tab(self, parent: tk.Misc):
+        ttk.Label(
+            parent,
+            text="記事の下書き欄です。空欄は既存テンプレートの執筆メモとして出力されます。",
+            wraplength=980,
+        ).pack(anchor="w", pady=(0, 8))
+        self._text(parent, "リード文", "lead", 4)
+        self._entry(parent, "告知ポスト等のURL", "announcement_url")
+        self._text(parent, "両チームの状況・順位について", "team_situation", 3)
+        self._text(parent, "出場停止について", "suspensions", 2)
+        self._text(parent, "負傷者・代表招集について", "absences", 2)
+        self._text(parent, "先発予想の前置き", "lineup_intro", 3)
+        self._text(parent, "勝ち筋・試合の見どころ", "win_path", 3)
+
+        tactics = ttk.LabelFrame(parent, text="攻撃のポイント", padding=8)
+        tactics.pack(fill="x", pady=5)
+        for index in (1, 2):
+            self._entry(tactics, f"{index}. 見出し", f"attack_{index}_title")
+            self._text(tactics, f"{index}. 本文", f"attack_{index}_body", 3)
+        tactics = ttk.LabelFrame(parent, text="守備のポイント", padding=8)
+        tactics.pack(fill="x", pady=5)
+        for index in (1, 2):
+            self._entry(tactics, f"{index}. 見出し", f"defense_{index}_title")
+            self._text(tactics, f"{index}. 本文", f"defense_{index}_body", 3)
+        self._text(parent, "締めの文", "closing", 3)
+
+    def _build_output_tab(self, parent: tk.Misc):
+        ttk.Label(
+            parent,
+            text="参考リンクは1行に「表示名 | URL」と入力してください。画像を選ぶと Markdown と同じ場所の attachments フォルダーへコピーされます。",
+            wraplength=980,
+        ).pack(anchor="w", pady=(0, 8))
+        self._text(parent, "参考リンク（任意）", "reference_links", 7)
+
+        image_box = ttk.LabelFrame(parent, text="添付画像", padding=8)
+        image_box.pack(fill="both", expand=True, pady=6)
+        self.image_list = tk.Listbox(image_box, height=6, selectmode="extended")
+        self.image_list.pack(side="left", fill="both", expand=True)
+        image_buttons = ttk.Frame(image_box)
+        image_buttons.pack(side="left", fill="y", padx=8)
+        ttk.Button(image_buttons, text="画像を追加", command=self._add_images).pack(fill="x", pady=3)
+        ttk.Button(image_buttons, text="選択を外す", command=self._remove_images).pack(fill="x", pady=3)
+
+        options = ttk.LabelFrame(parent, text="ローカル取得設定", padding=8)
+        options.pack(fill="x", pady=6)
+        ttk.Checkbutton(
+            options, text="対戦する2クラブの公式サイトからアクセス・グッズ等のリンクを収集する",
+            variable=self.collect_club_links_var,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            options, text="順位表と相手の前節ハイライトを追加で取得する（Jリーグ公式等）",
+            variable=self.collect_league_data_var,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            options, text="静的取得が拒否された場合、Playwright の表示ブラウザーで再取得する",
+            variable=self.playwright_var,
+        ).pack(anchor="w", pady=2)
+        ttk.Label(
+            options,
+            text="ブラウザー再取得でも拒否される場合は取得できません。試合情報は入力欄とクラブ公式サイトを使ってください。",
+            foreground="#555",
+            wraplength=930,
+        ).pack(anchor="w", padx=24, pady=(3, 0))
+
+        self.log_box = tk.Text(parent, height=6, wrap="word", state="disabled")
+        ttk.Label(parent, text="処理ログ").pack(anchor="w", pady=(8, 2))
+        self.log_box.pack(fill="x", expand=True)
+
+    def _add_images(self):
+        paths = filedialog.askopenfilenames(
+            title="Markdown に添付する画像を選択",
+            filetypes=[("画像ファイル", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff"), ("すべてのファイル", "*.*")],
+        )
+        for value in paths:
+            path = Path(value)
+            if path.suffix.lower() not in IMAGE_TYPES:
+                continue
+            if path not in self.selected_images:
+                self.selected_images.append(path)
+                self.image_list.insert("end", str(path))
+
+    def _remove_images(self):
+        selected = list(self.image_list.curselection())
+        for index in reversed(selected):
+            self.image_list.delete(index)
+            del self.selected_images[index]
+
+    def _snapshot(self) -> dict:
+        values = {key: value.get().strip() for key, value in self.vars.items()}
+        values.update({key: widget.get("1.0", "end-1c").strip() for key, widget in self.texts.items()})
+        values.update(
+            competition_type=self.competition_var.get(),
+            collect_club_links=self.collect_club_links_var.get(),
+            collect_league_data=self.collect_league_data_var.get(),
+            playwright=self.playwright_var.get(),
+            images=list(self.selected_images),
+        )
+        return values
+
+    def _start_generation(self):
+        values = self._snapshot()
+        if not values.get("my_team") or not values.get("opponent_team"):
+            messagebox.showwarning("入力を確認してください", "自チームと対戦相手を入力してください。")
+            return
+        default_name = self._suggest_filename(values)
+        output_value = filedialog.asksaveasfilename(
+            title="Markdown の保存先",
+            initialfile=default_name,
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md")],
+        )
+        if not output_value:
+            return
+        output_path = Path(output_value)
+        if output_path.suffix.lower() != ".md":
+            output_path = output_path.with_suffix(".md")
+        values["output_path"] = output_path
+        self.generate_button.configure(state="disabled")
+        self.status_var.set("Markdown を準備しています…")
+        self._append_log("作成を開始しました。ネットワーク取得中もウィンドウは操作できます。")
+        threading.Thread(target=self._generate_worker, args=(values,), daemon=True).start()
+
+    @staticmethod
+    def _safe_name(value: str) -> str:
+        value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" ._")
+        return value[:90] or "match-preview"
+
+    def _suggest_filename(self, values: dict) -> str:
+        serial = values.get("serial_number") or ""
+        prefix = f"D{serial}_" if serial else ""
+        return self._safe_name(prefix + values.get("my_team", "home") + "_vs_" + values.get("opponent_team", "away")) + ".md"
+
+    def _generate_worker(self, values: dict):
+        report = core.RunReport()
+        copied_images: list[tuple[str, str]] = []
+        try:
+            core.COMPETITION_TYPE = values["competition_type"]
+            core.RESPECT_ROBOTS_TXT = True
+            core.REQUEST_MIN_INTERVAL_SEC = 1.0
+            core.PLAYWRIGHT_HEADLESS = False
+            core.PLAYWRIGHT_CHANNEL = ""
+            core.USE_PLAYWRIGHT_FALLBACK = bool(values["playwright"])
+            core.CLUB_LINKS_JSON = ""
+            core.apply_extra_aliases(report)
+
+            config = core.build_preview_config(
+                serial_number=values.get("serial_number", ""),
+                season=values.get("season", ""),
+                competition=values.get("competition", ""),
+                round_label=values.get("round_label", ""),
+                my_team=values["my_team"],
+                opponent_team=values["opponent_team"],
+                use_official_club_name=True,
+                opponent_hashtag=values.get("opponent_hashtag", ""),
+                home_or_away=values.get("home_or_away", "ホーム"),
+                my_team_formation=values.get("my_team_formation", ""),
+                opponent_formation=values.get("opponent_formation", ""),
+                kickoff_date=values.get("kickoff_date", ""),
+                kickoff_time=values.get("kickoff_time", ""),
+                venue_name=values.get("venue_name", ""),
+                venue_address=values.get("venue_address", ""),
+                venue_map_url=values.get("venue_map_url", ""),
+                broadcast=values.get("broadcast", ""),
+                weather_text=values.get("weather_text", ""),
+                weather_url=values.get("weather_url", ""),
+                attack_point_count=2,
+                defense_point_count=2,
+                include_reference_section=True,
+                drive_folder_name="",
+                report=report,
+            )
+
+            club_links = []
+            if values["collect_club_links"]:
+                try:
+                    club_links = core.collect_club_site_links(
+                        config.home_team,
+                        config.away_team,
+                        config.kickoff_date,
+                        venue_name=config.venue_name,
+                        venue_map_url=config.venue_map_url,
+                        report=report,
+                    )
+                    found_count = sum(1 for link in club_links if getattr(link, "found", False))
+                    report.ok("クラブ公式サイト", f"リンク {found_count}件")
+                except Exception as exc:
+                    report.warn(f"クラブ公式サイトのリンク取得に失敗しました: {exc}")
+                    club_links = []
+
+            standings = None
+            highlight = None
+            if values["collect_league_data"]:
+                try:
+                    standings = core.fetch_standings(config.my_team, report)
+                except Exception as exc:
+                    report.warn(f"順位表の取得に失敗しました: {exc}")
+                try:
+                    highlight = core.fetch_previous_highlight(config.opponent_team, config.season, report)
+                except Exception as exc:
+                    report.warn(f"前節ハイライトの取得に失敗しました: {exc}")
+
+            structure = core.build_document_structure(
+                config, club_links=club_links, standings=standings, highlight=highlight
+            )
+            self._apply_article_text(structure, values)
+            self._append_reference_links(structure, values.get("reference_links", ""))
+
+            output_path: Path = values["output_path"]
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            for source in values.get("images", []):
+                try:
+                    attached = self._copy_image(source, output_path.parent / "attachments")
+                    relative = "attachments/" + quote(attached.name)
+                    copied_images.append((source.name, relative))
+                except Exception as exc:
+                    report.warn(f"画像を添付できませんでした（{source.name}）: {exc}")
+
+            markdown = self._render_markdown(structure, copied_images)
+            output_path.write_text(markdown, encoding="utf-8")
+            self.events.put(("complete", str(output_path), report.warnings, len(copied_images)))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    @staticmethod
+    def _copy_image(source: Path, destination: Path) -> Path:
+        destination.mkdir(parents=True, exist_ok=True)
+        base = source.stem
+        suffix = source.suffix.lower()
+        target = destination / f"{base}{suffix}"
+        index = 2
+        while target.exists():
+            target = destination / f"{base}-{index}{suffix}"
+            index += 1
+        shutil.copy2(source, target)
+        return target
+
+    @staticmethod
+    def _apply_article_text(structure: list[dict], values: dict):
+        replacements = (
+            ("（リード文：", "lead"),
+            ("（告知ポストなどのURLを貼る）", "announcement_url"),
+            ("（出場停止選手の有無。", "suspensions"),
+            ("（負傷者、代表招集による欠場の予想。", "absences"),
+            ("（先発予想の前置き：", "lineup_intro"),
+            ("（締めの文）", "closing"),
+        )
+        tactic = None
+        for item in structure:
+            kind = item.get("type")
+            content = str(item.get("content", ""))
+            if kind == "placeholder":
+                if content.startswith("（順位表を取得できませんでした"):
+                    continue
+                if content.startswith("（") and "順位、この試合で取りたい勝ち点" in content:
+                    key = "team_situation"
+                    candidate = values.get(key, "")
+                    if candidate:
+                        item["content"] = candidate
+                        item["type"] = "text"
+                    continue
+                for prefix, key in replacements:
+                    if content == prefix or content.startswith(prefix):
+                        candidate = values.get(key, "")
+                        if candidate:
+                            if key == "announcement_url":
+                                item["type"] = "link"
+                                item["label"] = "告知ポスト"
+                                item["url"] = candidate
+                            else:
+                                item["content"] = candidate
+                                item["type"] = "text"
+                        break
+                if content.startswith("（・で始まる着眼点"):
+                    candidate = values.get("win_path", "")
+                    if candidate:
+                        item["content"] = candidate
+                        item["type"] = "text"
+                elif content.startswith("（本文：") and tactic:
+                    candidate = values.get(f"{tactic[0]}_{tactic[1]}_body", "")
+                    if candidate:
+                        item["content"] = candidate
+                        item["type"] = "text"
+                    tactic = None
+            elif kind == "heading3":
+                match = re.match(r"^(\d+)\. （(攻撃|守備)のポイント", content)
+                if match:
+                    number = int(match.group(1))
+                    prefix = "attack" if match.group(2) == "攻撃" else "defense"
+                    tactic = (prefix, number)
+                    candidate = values.get(f"{prefix}_{number}_title", "")
+                    if candidate:
+                        item["content"] = f"{number}. {candidate}"
+
+    @staticmethod
+    def _append_reference_links(structure: list[dict], raw: str):
+        manual = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "|" in line:
+                label, url = (part.strip() for part in line.split("|", 1))
+            else:
+                label, url = line, line
+            if url:
+                manual.append((label or url, url))
+        if not manual:
+            return
+        reference = next((item for item in structure if item.get("type") == "links"), None)
+        if reference is None:
+            structure.extend(({"type": "spacer"}, {"type": "heading2", "content": core.SectionLabel.REFERENCE}))
+            reference = {"type": "links", "items": []}
+            structure.append(reference)
+        existing = {url for _label, url in reference.get("items", [])}
+        reference.setdefault("items", [])
+        for label, url in manual:
+            if url not in existing:
+                reference["items"].append((label, url))
+                existing.add(url)
+
+    @staticmethod
+    def _markdown_cell(value, placeholder=False, bold=False):
+        value = str(value).replace("|", "\\|").replace("\n", "<br>").strip()
+        if re.fullmatch(r"https?://\S+", value):
+            value = f"<{value}>"
+        if placeholder:
+            value = f"*{value}*"
+        if bold:
+            value = f"**{value}**"
+        return value
+
+    @classmethod
+    def _render_markdown(cls, structure: list[dict], images: list[tuple[str, str]]) -> str:
+        lines: list[str] = []
+        for item in structure:
+            kind = item.get("type", "")
+            content = str(item.get("content", ""))
+            if kind.startswith("heading"):
+                level = int(kind.removeprefix("heading"))
+                lines.extend(["#" * max(1, min(level, 6)) + " " + content, ""])
+            elif kind == "text":
+                lines.extend([f"**{content}**" if item.get("bold") else content, ""])
+            elif kind == "placeholder":
+                lines.extend([f"> *{content}*", ""])
+            elif kind == "labeled_placeholder":
+                lines.extend([f"**{item.get('label', '')}**", f"> *{content}*", ""])
+            elif kind == "spacer":
+                lines.append("")
+            elif kind == "link":
+                label = item.get("label") or item.get("url") or "リンク"
+                lines.extend([f"[{label}]({item.get('url', '')})", ""])
+            elif kind == "links":
+                for label, url in item.get("items", []):
+                    if url:
+                        lines.append(f"- [{label or url}]({url})")
+                lines.append("")
+            elif kind == "bullets":
+                lines.extend(f"- {value}" for value in item.get("items", []))
+                lines.append("")
+            elif kind == "table":
+                rows = item.get("rows") or []
+                if not rows:
+                    continue
+                uses_first_row_as_header = bool(item.get("detect_team_cells"))
+                header = rows[0] if uses_first_row_as_header else ["項目", "内容"]
+                body = rows[1:] if uses_first_row_as_header else rows
+                width = max([len(header)] + [len(row) for row in body])
+                header = list(header) + [""] * (width - len(header))
+                lines.append("| " + " | ".join(cls._markdown_cell(value) for value in header) + " |")
+                lines.append("| " + " | ".join("---" for _ in range(width)) + " |")
+                placeholders = item.get("placeholder_cells", set())
+                for body_index, row in enumerate(body):
+                    cells = []
+                    source_index = body_index + (1 if uses_first_row_as_header else 0)
+                    for column, value in enumerate(list(row) + [""] * (width - len(row))):
+                        is_placeholder = (source_index, column) in placeholders
+                        bold = column in item.get("bold_columns", [])
+                        cells.append(cls._markdown_cell(value, is_placeholder, bold))
+                    lines.append("| " + " | ".join(cells) + " |")
+                lines.append("")
+        if images:
+            lines.extend(["## 添付画像", ""])
+            for name, relative in images:
+                lines.extend([f"![{name}]({relative})", ""])
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _poll_events(self):
+        try:
+            while True:
+                event = self.events.get_nowait()
+                if event[0] == "complete":
+                    _, path, warnings, image_count = event
+                    self.status_var.set(f"Markdown を保存しました: {path}")
+                    self._append_log(f"保存先: {path}")
+                    self._append_log(f"画像添付: {image_count}件")
+                    if warnings:
+                        self._append_log("取得メモ: " + " / ".join(warnings))
+                    else:
+                        self._append_log("取得時の警告はありませんでした。")
+                    messagebox.showinfo("作成完了", f"Markdown を保存しました。\n\n{path}")
+                    self.generate_button.configure(state="normal")
+                elif event[0] == "error":
+                    self.status_var.set("作成に失敗しました")
+                    self._append_log("エラー: " + event[1])
+                    messagebox.showerror("作成に失敗しました", event[1])
+                    self.generate_button.configure(state="normal")
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_events)
+
+    def _append_log(self, message: str):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", message + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+
+def main():
+    root = tk.Tk()
+    DankobaLocalApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

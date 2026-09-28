@@ -223,6 +223,15 @@ class NetworkConfig:
     playwright_channel: str = ""
 
 
+def build_network_config() -> NetworkConfig:
+    """ローカル設定から通信設定を作る。"""
+    return NetworkConfig(
+        respect_robots=bool(RESPECT_ROBOTS_TXT),
+        min_interval_sec=float(REQUEST_MIN_INTERVAL_SEC or 0),
+        playwright_headless=bool(PLAYWRIGHT_HEADLESS),
+        playwright_channel=str(PLAYWRIGHT_CHANNEL or "").strip(),
+    )
+
 def build_session(network: NetworkConfig) -> requests.Session:
     """一時エラーだけ再試行するセッション。Konwenga [3/9] からの移植。"""
     session = requests.Session()

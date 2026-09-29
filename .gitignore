@@ -1,0 +1,5 @@
+D*.md
+__pycache__/
+build/
+dist/
+build_assets/

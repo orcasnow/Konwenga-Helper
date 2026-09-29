@@ -14,6 +14,12 @@ python Dankoba_Helper_Local.py
 
 Windows では `run_local_app.bat` をダブルクリックして起動できます。画面には Python 標準の Tkinter を使い、`requirements-local.txt` のパッケージはローカル処理モジュールの読み込みと公式サイト取得に使います。Google API や外部サービスの認証は不要です。
 
+### Windows用の単体実行ファイルを作る
+
+Windows上でプロジェクトの `build_windows_exe.bat` を実行してください。必要なPythonパッケージ、PyInstaller、Playwright用Chromiumを準備して、`dist\Dankoba_Helper_Local.exe` を作成します。初回ビルドにはネット接続と十分な作業用空き容量が必要です。
+
+作成したEXEは別のWindows PCへコピーして起動できます。利用側にPython、pip、Playwrightのインストールは不要です。実行ファイルにはChromiumを含むためサイズが大きく、起動時に同梱ファイルを一時フォルダーへ展開します。実行時の公式サイト情報取得にはインターネット接続が必要です。
+
 ### 表示ブラウザーによる再取得
 
 Playwright の再取得は初期状態で有効です。初回セットアップ時に上記のコマンドでPythonパッケージとChromiumを入れてください。

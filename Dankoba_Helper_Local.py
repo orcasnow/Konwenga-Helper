@@ -5,14 +5,20 @@ from __future__ import annotations
 
 import queue
 import logging
+import os
 import re
 import shutil
+import sys
 import threading
 import tkinter as tk
 from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote
+
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    # PyInstaller one-file実行では同梱ブラウザーが一時展開先にある。
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(Path(sys._MEIPASS) / "pw-browsers")
 
 try:
     import dankoba_local_core as core

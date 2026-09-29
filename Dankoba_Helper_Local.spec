@@ -7,7 +7,9 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 
-ROOT = Path(__file__).resolve().parent
+# PyInstaller spec execution does not define __file__; SPECPATH is supplied by
+# PyInstaller and points to the directory containing the spec file.
+ROOT = Path(SPECPATH or ".").resolve()
 browser_root_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
 BROWSER_ROOT = Path(browser_root_value) if browser_root_value else None
 if BROWSER_ROOT is None or not BROWSER_ROOT.is_dir():

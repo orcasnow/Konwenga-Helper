@@ -59,41 +59,40 @@ def _fill_match_details(values: dict, report: core.RunReport) -> None:
     competition = core.competition_type(values["competition_type"])
     core.logger.info("%s の日程から %s vs %s の試合を検索します",
                      competition.name, values["my_team"], values["opponent_team"])
+    info = None
     try:
         info = lookup.resolve(values["my_team"], values["opponent_team"], competition)
     except Exception as exc:
         core.logger.exception("大会日程からの試合情報取得に失敗しました")
         report.warn(f"大会日程からの自動取得に失敗しました: {exc}")
-        return
 
     if info is None:
         core.logger.info("日程から試合を特定できませんでした。入力済みの値で続けます")
-        return
-
-    core.MATCH_PAGE_URL = info.url
-    discovered = {
-        "round_label": info.round_label,
-        "kickoff_date": info.kickoff_date,
-        "kickoff_time": info.kickoff_time,
-        "venue_name": info.venue_name,
-        "venue_address": info.venue_address,
-        "venue_map_url": info.venue_map_url,
-        "broadcast": info.broadcast,
-    }
-    if info.home_team:
-        discovered["home_or_away"] = (
-            "ホーム"
-            if core.JLeagueScheduleLookup._loose_match(info.home_team, values["my_team"])
-            else "アウェイ"
-        )
-    filled = []
-    for key, value in discovered.items():
-        if value and not str(values.get(key, "")).strip():
-            values[key] = str(value)
-            filled.append(key)
-    core.logger.info("日程から取得した値を反映しました: %s",
-                     "、".join(filled) if filled else "入力済みの値を維持しました")
-    core.logger.info("試合情報の取得元: %s", info.url)
+    else:
+        core.MATCH_PAGE_URL = info.url
+        discovered = {
+            "round_label": info.round_label,
+            "kickoff_date": info.kickoff_date,
+            "kickoff_time": info.kickoff_time,
+            "venue_name": info.venue_name,
+            "venue_address": info.venue_address,
+            "venue_map_url": info.venue_map_url,
+            "broadcast": info.broadcast,
+        }
+        if info.home_team:
+            discovered["home_or_away"] = (
+                "ホーム"
+                if core.JLeagueScheduleLookup._loose_match(info.home_team, values["my_team"])
+                else "アウェイ"
+            )
+        filled = []
+        for key, value in discovered.items():
+            if value and not str(values.get(key, "")).strip():
+                values[key] = str(value)
+                filled.append(key)
+        core.logger.info("日程から取得した値を反映しました: %s",
+                         "、".join(filled) if filled else "入力済みの値を維持しました")
+        core.logger.info("試合情報の取得元: %s", info.url)
 
     if not core.AUTO_FILL_WEATHER or str(values.get("weather_text", "")).strip():
         return
@@ -238,7 +237,10 @@ class DankobaLocalApp:
             wraplength=980,
         ).pack(anchor="w", pady=(0, 10))
         self._entry(parent, "記事番号", "serial_number")
-        self._entry(parent, "シーズン", "season", f"{date.today().year}/{str(date.today().year + 1)[-2:]}")
+        today = date.today()
+        season_start_year = today.year if today.month >= 8 else today.year - 1
+        season_default = f"{season_start_year}/{str(season_start_year + 1)[-2:]}"
+        self._entry(parent, "シーズン", "season", season_default)
         self._entry(parent, "大会名（任意）", "competition")
         self._entry(parent, "節・ラウンド", "round_label")
         self._entry(parent, "自チーム", "my_team", required=True)

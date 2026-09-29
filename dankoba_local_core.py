@@ -1217,8 +1217,8 @@ class JLeagueScheduleLookup:
             self._warn("Jリーグ公式の日程を取得できませんでした: %s", url)
             return "", ""
 
-        def extract_candidates(current_page: FetchResult) -> List[Tuple[date, str, str]]:
-            found: List[Tuple[date, str, str]] = []
+        def extract_candidates(current_page: FetchResult) -> List[Tuple[date, str, str, Any]]:
+            found: List[Tuple[date, str, str, Any]] = []
             seen: set = set()
             date_matched = 0
             teams_matched = 0
@@ -1240,7 +1240,9 @@ class JLeagueScheduleLookup:
                 if opponent_team and not self._mentions(surrounding, opponent_team):
                     continue
                 teams_matched += 1
-                found.append((kickoff, match_url, surrounding))
+                found.append((
+                    kickoff, match_url, surrounding, self._container_element(anchor)
+                ))
             logger.info(
                 "日程HTMLの判定結果: 試合ページリンク=%s件、期間内=%s件、両クラブ一致=%s件",
                 len(seen), date_matched, teams_matched,
@@ -1268,7 +1270,8 @@ class JLeagueScheduleLookup:
             return "", ""
 
         candidates.sort(key=lambda item: item[0])
-        kickoff, match_url, surrounding = candidates[0]
+        kickoff, match_url, surrounding, schedule_row = candidates[0]
+        self.last_schedule_row = schedule_row
         logger.info("対象試合: %s（%s）", kickoff.isoformat(), match_url)
         return match_url, surrounding
 
@@ -1547,6 +1550,7 @@ class JLeagueScheduleLookup:
         competition: CompetitionType,
         match_page_url: str = "",
     ) -> Optional[JLeagueMatchInfo]:
+        self.last_schedule_row = None
         url = str(match_page_url or "").strip()
         row_text = ""
         if url:

@@ -29,7 +29,7 @@ except ImportError as exc:
     ) from exc
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0"
 IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
 
 
@@ -155,9 +155,10 @@ class DankobaLocalApp:
         self.status_var = tk.StringVar(value="入力して Markdown を作成してください")
         self.competition_var = tk.StringVar(value="J1")
         self.collect_club_links_var = tk.BooleanVar(value=True)
-        self.collect_standings_var = tk.BooleanVar(value=False)
+        self.collect_standings_var = tk.BooleanVar(value=True)
         self.collect_highlight_var = tk.BooleanVar(value=True)
         self.playwright_var = tk.BooleanVar(value=True)
+        self.competition_var.trace_add("write", self._on_competition_changed)
         self._build_ui()
         self.root.after(150, self._poll_events)
 
@@ -193,14 +194,22 @@ class DankobaLocalApp:
         self.texts[key] = text
         return text
 
+    def _on_competition_changed(self, *_args):
+        self.collect_standings_var.set(self.competition_var.get() in {"J1", "J2", "J3"})
+
     def _build_ui(self):
-        top = ttk.LabelFrame(self.root, text="大会種別", padding=(12, 7))
+        top = ttk.Frame(self.root)
         top.pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Label(top, text="この記事の大会 ＊必須", foreground="#b3261e").pack(side="left", padx=(0, 12))
+        competition_box = ttk.LabelFrame(top, text="大会種別", padding=(12, 7))
+        competition_box.pack(side="left", fill="y")
+        ttk.Label(competition_box, text="この記事の大会 ＊必須", foreground="#b3261e").pack(anchor="w")
+        competition_radios = ttk.Frame(competition_box)
+        competition_radios.pack(anchor="w")
         for item in core.COMPETITION_TYPES:
             ttk.Radiobutton(
-                top, text=item.name, value=item.name, variable=self.competition_var
-            ).pack(side="left", padx=7)
+                competition_radios, text=item.name, value=item.name, variable=self.competition_var
+            ).pack(side="left", padx=(0, 7))
+        self._build_local_settings(top)
 
         tabs = ttk.Notebook(self.root)
         tabs.pack(fill="both", expand=True, padx=10, pady=6)
@@ -298,10 +307,15 @@ class DankobaLocalApp:
         ttk.Button(image_buttons, text="画像を追加", command=self._add_images).pack(fill="x", pady=3)
         ttk.Button(image_buttons, text="選択を外す", command=self._remove_images).pack(fill="x", pady=3)
 
+        self.log_box = tk.Text(parent, height=8, wrap="word", state="disabled")
+        ttk.Label(parent, text="処理ログ").pack(anchor="w", pady=(8, 2))
+        self.log_box.pack(fill="x", expand=True)
+
+    def _build_local_settings(self, parent: tk.Misc):
         options = ttk.LabelFrame(parent, text="ローカル取得設定", padding=8)
-        options.pack(fill="x", pady=6)
+        options.pack(side="left", fill="both", expand=True, padx=(8, 0))
         ttk.Checkbutton(
-            options, text="対戦する2クラブの公式サイトからアクセス・グッズ等のリンクを収集する",
+            options, text="対戦する2クラブの公式サイトから参考リンクを収集する",
             variable=self.collect_club_links_var,
         ).pack(anchor="w", pady=2)
         ttk.Checkbutton(
@@ -313,19 +327,15 @@ class DankobaLocalApp:
             variable=self.collect_highlight_var,
         ).pack(anchor="w", pady=2)
         ttk.Checkbutton(
-            options, text="静的HTMLで試合情報を判定できない場合、Playwright の表示ブラウザーで再取得する",
+            options, text="静的HTMLで判定できない場合、Playwrightで再取得する",
             variable=self.playwright_var,
         ).pack(anchor="w", pady=2)
         ttk.Label(
             options,
             text="ブラウザー再取得でも拒否される場合は取得できません。試合情報は入力欄とクラブ公式サイトを使ってください。",
             foreground="#555",
-            wraplength=930,
+            wraplength=580,
         ).pack(anchor="w", padx=24, pady=(3, 0))
-
-        self.log_box = tk.Text(parent, height=6, wrap="word", state="disabled")
-        ttk.Label(parent, text="処理ログ").pack(anchor="w", pady=(8, 2))
-        self.log_box.pack(fill="x", expand=True)
 
     def _add_images(self):
         paths = filedialog.askopenfilenames(

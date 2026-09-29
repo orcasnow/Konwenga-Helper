@@ -9,7 +9,7 @@ import re
 import shutil
 import threading
 import tkinter as tk
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import quote
@@ -64,6 +64,7 @@ def _fill_match_details(values: dict, report: core.RunReport) -> None:
         core.logger.info("日程から試合を特定できませんでした。入力済みの値で続けます")
         return
 
+    core.MATCH_PAGE_URL = info.url
     discovered = {
         "round_label": info.round_label,
         "kickoff_date": info.kickoff_date,
@@ -148,7 +149,8 @@ class DankobaLocalApp:
         self.status_var = tk.StringVar(value="入力して Markdown を作成してください")
         self.competition_var = tk.StringVar(value="J1")
         self.collect_club_links_var = tk.BooleanVar(value=True)
-        self.collect_league_data_var = tk.BooleanVar(value=False)
+        self.collect_standings_var = tk.BooleanVar(value=False)
+        self.collect_highlight_var = tk.BooleanVar(value=True)
         self.playwright_var = tk.BooleanVar(value=True)
         self._build_ui()
         self.root.after(150, self._poll_events)
@@ -217,10 +219,10 @@ class DankobaLocalApp:
     def _build_match_tab(self, parent: tk.Misc):
         ttk.Label(
             parent,
-            text="＊は必須項目です。大会と両クラブから今後の試合日程を検索し、日時・会場・中継などを空欄に補います。取得結果を確認してから Markdown を作成します。",
+            text="大会種別と両クラブから試合日程を検索し、日時・会場・中継などを空欄に補います。記事番号や布陣は未入力でも先に検索し、取得結果を確認してから Markdown を作成できます。",
             wraplength=980,
         ).pack(anchor="w", pady=(0, 10))
-        self._entry(parent, "記事番号", "serial_number", required=True)
+        self._entry(parent, "記事番号", "serial_number")
         self._entry(parent, "シーズン", "season", f"{date.today().year}/{str(date.today().year + 1)[-2:]}")
         self._entry(parent, "大会名（任意）", "competition")
         self._entry(parent, "節・ラウンド", "round_label")
@@ -238,8 +240,8 @@ class DankobaLocalApp:
         self._entry(parent, "キックオフ日", "kickoff_date", "", width=20)
         ttk.Label(parent, text="日付は YYYY-MM-DD 形式で入力してください。", foreground="#666").pack(anchor="w", padx=(160, 0))
         self._entry(parent, "キックオフ時刻", "kickoff_time", "", width=20)
-        self._entry(parent, "自チームの布陣", "my_team_formation", width=20, required=True)
-        self._entry(parent, "相手の布陣", "opponent_formation", width=20, required=True)
+        self._entry(parent, "自チームの布陣", "my_team_formation", width=20)
+        self._entry(parent, "相手の布陣", "opponent_formation", width=20)
         self._entry(parent, "会場", "venue_name")
         self._entry(parent, "会場住所", "venue_address")
         self._entry(parent, "地図URL", "venue_map_url")
@@ -297,11 +299,15 @@ class DankobaLocalApp:
             variable=self.collect_club_links_var,
         ).pack(anchor="w", pady=2)
         ttk.Checkbutton(
-            options, text="順位表と相手の前節ハイライトを追加で取得する（Jリーグ公式等）",
-            variable=self.collect_league_data_var,
+            options, text="順位表を追加で取得する（Jリーグ公式）",
+            variable=self.collect_standings_var,
         ).pack(anchor="w", pady=2)
         ttk.Checkbutton(
-            options, text="静的取得が拒否された場合、Playwright の表示ブラウザーで再取得する",
+            options, text="相手の前節ハイライト動画を検索する（既定で有効）",
+            variable=self.collect_highlight_var,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            options, text="静的HTMLで試合情報を判定できない場合、Playwright の表示ブラウザーで再取得する",
             variable=self.playwright_var,
         ).pack(anchor="w", pady=2)
         ttk.Label(
@@ -340,7 +346,8 @@ class DankobaLocalApp:
         values.update(
             competition_type=self.competition_var.get(),
             collect_club_links=self.collect_club_links_var.get(),
-            collect_league_data=self.collect_league_data_var.get(),
+            collect_standings=self.collect_standings_var.get(),
+            collect_highlight=self.collect_highlight_var.get(),
             playwright=self.playwright_var.get(),
             images=list(self.selected_images),
         )
@@ -349,11 +356,8 @@ class DankobaLocalApp:
     def _start_generation(self):
         values = self._snapshot()
         required_fields = (
-            ("serial_number", "記事番号"),
             ("my_team", "自チーム"),
             ("opponent_team", "対戦相手"),
-            ("my_team_formation", "自チームの布陣"),
-            ("opponent_formation", "相手の布陣"),
         )
         missing = [label for key, label in required_fields if not values.get(key, "").strip()]
         valid_competitions = {item.name for item in core.COMPETITION_TYPES}
@@ -409,9 +413,33 @@ class DankobaLocalApp:
                 f"{label}: {value or '（未取得・必要なら試合情報タブで入力）'}"
                 for label, value in fields
             ]
+            lines.extend(("", "検索で取得した付加情報"))
+            found_links = [
+                link for link in response.get("club_links", [])
+                if getattr(link, "found", False) and getattr(link, "url", "")
+            ]
+            lines.append(f"クラブ公式サイトの参考リンク: {len(found_links)}件")
+            for link in found_links[:5]:
+                lines.append(f"・{link.category}: {link.label or link.url} — {link.url[:90]}")
+            if len(found_links) > 5:
+                lines.append(f"・ほか {len(found_links) - 5}件（参考リンクに追加）")
+            standings = response.get("standings")
+            if standings and getattr(standings, "rows", None):
+                lines.append(f"順位表: 取得済み（{standings.league}、{len(standings.rows) - 1}クラブ）")
+            elif values.get("collect_standings"):
+                lines.append("順位表: 未取得")
+            highlight = response.get("highlight")
+            if highlight and getattr(highlight, "url", ""):
+                lines.append(f"前節ハイライト: {highlight.title or highlight.url}")
+            elif values.get("collect_highlight"):
+                lines.append("前節ハイライト: 未取得")
+            warnings = response.get("warnings", [])
+            if warnings:
+                lines.append(f"検索時の注意: {len(warnings)}件（詳細は処理ログを確認）")
+            lines.extend(("", "記事番号や布陣など、検索対象外の項目が空欄でも作成できます。"))
             lines.extend(("", "この内容で Markdown を作成しますか？"))
             accepted = messagebox.askyesno(
-                "試合情報の確認",
+                "検索結果の確認",
                 "\n".join(lines),
                 parent=self.root,
             )
@@ -454,15 +482,19 @@ class DankobaLocalApp:
         report = core.RunReport()
         copied_images: list[tuple[str, str]] = []
         log_handler = _QueueLogHandler(self.events)
-        log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        log_handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
         core.logger.addHandler(log_handler)
         try:
             core.logger.info("Dankoba Helper Local Ver.%s", APP_VERSION)
             core.logger.info("Markdown作成を開始します")
             core.logger.info(
-                "設定: 公式リンク=%s、順位表・ハイライト=%s、Playwright=%s",
+                "設定: 公式リンク=%s、順位表=%s、ハイライト=%s、Playwright=%s",
                 "有効" if values["collect_club_links"] else "無効",
-                "有効" if values["collect_league_data"] else "無効",
+                "有効" if values["collect_standings"] else "無効",
+                "有効" if values["collect_highlight"] else "無効",
                 "有効" if values["playwright"] else "無効",
             )
             core.COMPETITION_TYPE = values["competition_type"]
@@ -477,6 +509,7 @@ class DankobaLocalApp:
             core.SERIAL_NUMBER = values["serial_number"]
             core.MY_TEAM_FORMATION = values["my_team_formation"]
             core.OPPONENT_FORMATION = values["opponent_formation"]
+            core.MATCH_PAGE_URL = ""
             core.apply_extra_aliases(report)
 
             _fill_match_details(values, report)
@@ -521,15 +554,6 @@ class DankobaLocalApp:
                 config.venue_name or "会場未設定",
             )
 
-            review_response = {"config": config, "accepted": False}
-            review_ready = threading.Event()
-            self.events.put(("review", values, review_response, review_ready))
-            review_ready.wait()
-            if not review_response["accepted"]:
-                self.events.put(("cancelled",))
-                return
-            values["output_path"] = review_response["output_path"]
-
             club_links = []
             if values["collect_club_links"]:
                 core.logger.info("クラブ公式サイトのリンク収集を開始します")
@@ -551,19 +575,36 @@ class DankobaLocalApp:
 
             standings = None
             highlight = None
-            if values["collect_league_data"]:
+            if values["collect_standings"]:
                 try:
                     core.logger.info("Jリーグ順位表を取得します: %s", config.my_team)
                     standings = core.fetch_standings(config.my_team, report)
                     core.logger.info("Jリーグ順位表の取得が完了しました")
                 except Exception as exc:
                     report.warn(f"順位表の取得に失敗しました: {exc}")
+            if values["collect_highlight"]:
                 try:
                     core.logger.info("対戦相手の前節ハイライトを検索します: %s", config.opponent_team)
                     highlight = core.fetch_previous_highlight(config.opponent_team, config.season, report)
                     core.logger.info("前節ハイライトの検索が完了しました")
                 except Exception as exc:
                     report.warn(f"前節ハイライトの取得に失敗しました: {exc}")
+
+            review_response = {
+                "config": config,
+                "accepted": False,
+                "club_links": club_links,
+                "standings": standings,
+                "highlight": highlight,
+                "warnings": list(report.warnings),
+            }
+            review_ready = threading.Event()
+            self.events.put(("review", values, review_response, review_ready))
+            review_ready.wait()
+            if not review_response["accepted"]:
+                self.events.put(("cancelled",))
+                return
+            values["output_path"] = review_response["output_path"]
 
             core.logger.info("Markdownの構成を組み立てます")
             structure = core.build_document_structure(
@@ -766,8 +807,8 @@ class DankobaLocalApp:
                     self._append_log(event[1])
                 elif event[0] == "review":
                     _, values, response, ready = event
-                    self.status_var.set("取得した試合情報を確認してください")
-                    self._append_log("大会日程から取得した内容を確認します。")
+                    self.status_var.set("検索が完了しました。取得結果を確認してください")
+                    self._append_log("有効にした検索が完了しました。取得結果を確認します。")
                     self._review_match_info(values, response, ready)
                 elif event[0] == "cancelled":
                     self.status_var.set("作成をキャンセルしました")
@@ -794,6 +835,8 @@ class DankobaLocalApp:
         self.root.after(150, self._poll_events)
 
     def _append_log(self, message: str):
+        if not re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]", message):
+            message = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}"
         self.log_box.configure(state="normal")
         self.log_box.insert("end", message + "\n")
         self.log_box.see("end")

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import calendar
 import json
 import logging
 import os
@@ -84,7 +85,9 @@ def setup_logging(level: str = "INFO") -> None:
         logger.removeHandler(handler)
     handler = _NotebookLogHandler()
     handler.set_name(LOG_HANDLER_NAME)
-    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
     logger.addHandler(handler)
     logger.setLevel(resolved_level)
     logger.propagate = False
@@ -518,7 +521,7 @@ class PageFetcher:
             return None
         url, original_url = self._prefer_https(url), url
         cache_key = f"{url}|{wait_selector}"
-        if cache_key in self._cache:
+        if cache_key in self._cache and not force_render:
             logger.info("取得済みのページを再利用します: %s", url)
             return self._cache[cache_key]
         if not self.robots.is_allowed(url):
@@ -614,8 +617,8 @@ class PageFetcher:
                 html = run_in_notebook(self._render_async(url, wait_selector))
             except ModuleNotFoundError:
                 self._warn(
-                    "Playwright が入っていません。セル[1/10]の "
-                    "INSTALL_PLAYWRIGHT_BROWSER を True にして流し直してください"
+                    "Playwright のPythonパッケージが見つかりません。"
+                    "依存パッケージをインストールしてから実行してください"
                 )
                 return None
             except Exception as error:
@@ -1061,8 +1064,8 @@ class JLeagueScheduleLookup:
     """日程検索から該当カードの試合ページを探し、その中身を読む。
 
     試合ページはサーバ側で組み立てられているので静的HTMLで読める。
-    日程検索のほうはJavaScriptで描いている可能性があるので、
-    リンクが1本も見つからなければ Playwright に落とす。"""
+    日程検索のほうはJavaScript描画やマークアップ差で候補が取れないことがあるため、
+    条件に合う試合が見つからなければ Playwright で再取得する。"""
 
     # /match/j1/2026/091902/ の形
     MATCH_URL_PATTERN = re.compile(
@@ -1140,7 +1143,16 @@ class JLeagueScheduleLookup:
         どの候補も両チーム名を含むことになる。そこで、祖先に含まれる
         試合リンクが1本のままである限り上へたどり、2本目が現れる
         直前で止める。マークアップの形に依存しない。"""
-        best = anchor.get_text(" ", strip=True)
+        def element_text(element) -> str:
+            parts = [element.get_text(" ", strip=True)]
+            for child in element.find_all(True):
+                for attribute in ("alt", "title", "aria-label", "data-club-name", "data-team-name"):
+                    value = child.get(attribute)
+                    if value:
+                        parts.append(str(value).strip())
+            return " ".join(part for part in parts if part)
+
+        best = element_text(anchor)
         node = anchor
         for _ in range(max_levels):
             node = node.parent
@@ -1154,19 +1166,30 @@ class JLeagueScheduleLookup:
             }
             if len(urls) != 1:
                 break
-            best = node.get_text(" ", strip=True)
+            best = element_text(node)
         return best
 
     ROW_DATE_PATTERN = re.compile(r"(20\d{2})\s*/\s*(\d{1,2})\s*/\s*(\d{1,2})")
 
-    def _row_date(self, text: str) -> Optional[date]:
+    def _row_date(self, text: str, match_url: str = "") -> Optional[date]:
         found = self.ROW_DATE_PATTERN.search(str(text or ""))
-        if not found:
-            return None
-        try:
-            return date(*(int(value) for value in found.groups()))
-        except ValueError:
-            return None
+        if found:
+            try:
+                return date(*(int(value) for value in found.groups()))
+            except ValueError:
+                pass
+
+        # /match/leaguecup/2026/092908/ の末尾は MMDD + 試合番号。
+        # 一覧の表示形式が変わっても、日付は試合ページURLから補える。
+        url_match = self.MATCH_URL_PATTERN.search(str(match_url or ""))
+        if url_match:
+            year = int(url_match.group(2))
+            date_code = url_match.group(3)
+            try:
+                return date(year, int(date_code[:2]), int(date_code[2:4]))
+            except ValueError:
+                return None
+        return None
 
     def find_target_match(
         self,
@@ -1194,25 +1217,47 @@ class JLeagueScheduleLookup:
             self._warn("Jリーグ公式の日程を取得できませんでした: %s", url)
             return "", ""
 
-        candidates: List[Tuple[date, str, str]] = []
-        seen: set = set()
-        for anchor in page.soup.find_all("a", href=True):
-            href = str(anchor.get("href"))
-            if not self.MATCH_URL_PATTERN.search(href):
-                continue
-            match_url = urljoin(page.url, href)
-            if match_url in seen:
-                continue
-            seen.add(match_url)
-            surrounding = self._container_text(anchor)
-            if not self._mentions(surrounding, my_team):
-                continue
-            if opponent_team and not self._mentions(surrounding, opponent_team):
-                continue
-            kickoff = self._row_date(surrounding)
-            if kickoff is None or kickoff < today:
-                continue
-            candidates.append((kickoff, match_url, surrounding))
+        def extract_candidates(current_page: FetchResult) -> List[Tuple[date, str, str]]:
+            found: List[Tuple[date, str, str]] = []
+            seen: set = set()
+            date_matched = 0
+            teams_matched = 0
+            for anchor in current_page.soup.find_all("a", href=True):
+                href = str(anchor.get("href"))
+                if not self.MATCH_URL_PATTERN.search(href):
+                    continue
+                match_url = urljoin(current_page.url, href)
+                if match_url in seen:
+                    continue
+                seen.add(match_url)
+                surrounding = self._container_text(anchor)
+                kickoff = self._row_date(surrounding, match_url)
+                if kickoff is None or kickoff < today or kickoff > today + timedelta(days=TARGET_MATCH_WINDOW_DAYS):
+                    continue
+                date_matched += 1
+                if not self._mentions(surrounding, my_team):
+                    continue
+                if opponent_team and not self._mentions(surrounding, opponent_team):
+                    continue
+                teams_matched += 1
+                found.append((kickoff, match_url, surrounding))
+            logger.info(
+                "日程HTMLの判定結果: 試合ページリンク=%s件、期間内=%s件、両クラブ一致=%s件",
+                len(seen), date_matched, teams_matched,
+            )
+            return found
+
+        candidates = extract_candidates(page)
+        if not candidates and self.render_on_miss and page.source != "Playwright":
+            logger.info("静的HTMLから対象試合を特定できないため、Playwrightで日程を再取得します")
+            rendered = self.fetcher.fetch(
+                url,
+                use_playwright_fallback=True,
+                wait_selector="a[href*='/match/']",
+                force_render=True,
+            )
+            if rendered is not None and rendered.soup is not None:
+                candidates = extract_candidates(rendered)
 
         if not candidates:
             self._warn(
@@ -1534,7 +1579,6 @@ class JLeagueScheduleLookup:
 # 動画が無ければ次に新しい試合へ進む。
 # ============================================================
 # シーズンは8月開幕。"2026/27" なら 2026-08-01 から。
-SEASON_START_MONTH_DAY: Final[str] = "08-01"
 YOUTUBE_ID_PATTERN = re.compile(
     r"(?:youtube\.com/(?:watch\?v=|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})"
 )
@@ -1558,34 +1602,33 @@ class JLeagueHighlightLookup:
         self.fetcher = fetcher
         self.report = report
         # 行の切り出しは日程検索と同じやり方を使う
-        self._schedule = JLeagueScheduleLookup(fetcher, report)
+        self._schedule = JLeagueScheduleLookup(fetcher, report, render_on_miss=True)
 
     def _warn(self, message: str, *args: Any) -> None:
         emit_warning(self.report, message, *args)
 
     @staticmethod
-    def season_start(season: str) -> str:
-        """"2026/27" から "2026-08-01" を作る。"""
-        year = re.search(r"(20\d{2})", str(season or ""))
-        if not year:
-            fallback = date.today()
-            # 8月より前なら前年のシーズンとみなす
-            start_year = fallback.year if fallback.month >= 8 else fallback.year - 1
-            logger.info("シーズン %r を読み取れないため %s年開幕として扱います", season, start_year)
-            return f"{start_year}-{SEASON_START_MONTH_DAY}"
-        return f"{year.group(1)}-{SEASON_START_MONTH_DAY}"
+    def lookback_start(today: date, months: int = 2) -> date:
+        """暦上の指定月数前。同じ日がない月は月末に合わせる。"""
+        month_index = today.year * 12 + (today.month - 1) - months
+        year, month_index = divmod(month_index, 12)
+        month = month_index + 1
+        day = min(today.day, calendar.monthrange(year, month)[1])
+        return date(year, month, day)
 
     def search_url(self, league: str, season: str, club_param: str = "") -> str:
-        """シーズン開幕から実行日まで、新しい順。club= でそのクラブに絞る。
+        """実行日の2カ月前から今日まで、新しい順。club= でそのクラブに絞る。
         全大会を見たいので category はリーグのコードを入れつつ、
         カップ戦も拾えるよう同じパスの一覧を使う。"""
         code = str(league or "j1").strip().lower()
         if code not in JLEAGUE_SCHEDULE_LEAGUES:
             code = "j1"
         competition = CompetitionType(code.upper(), code, code, "", True)
-        start = datetime.strptime(self.season_start(season), "%Y-%m-%d").date()
+        today = date.today()
+        start = self.lookback_start(today)
+        logger.info("ハイライト検索期間: %s から %s", start.isoformat(), today.isoformat())
         return jleague_search_url(
-            competition, start, date.today(),
+            competition, start, today,
             club_params=[club_param] if club_param else (), sort_desc=True,
         )
 
@@ -1607,21 +1650,41 @@ class JLeagueHighlightLookup:
             self._warn("Jリーグ公式の日程・結果を取得できませんでした: %s", url)
             return []
 
-        found: List[Tuple[str, str]] = []
-        seen: set = set()
-        for anchor in page.soup.find_all("a", href=True):
-            href = str(anchor.get("href"))
-            if not self._schedule.MATCH_URL_PATTERN.search(href):
-                continue
-            match_url = urljoin(page.url, href)
-            if match_url in seen:
-                continue
-            seen.add(match_url)
-            surrounding = self._schedule._container_text(anchor)
-            if self._mentions(surrounding, opponent_team):
-                found.append((match_url, surrounding))
-            if len(found) >= HIGHLIGHT_MAX_MATCHES:
-                break
+        today = date.today()
+
+        def extract_candidates(current_page: FetchResult) -> List[Tuple[date, str, str]]:
+            candidates: List[Tuple[date, str, str]] = []
+            seen: set = set()
+            for anchor in current_page.soup.find_all("a", href=True):
+                href = str(anchor.get("href"))
+                if not self._schedule.MATCH_URL_PATTERN.search(href):
+                    continue
+                match_url = urljoin(current_page.url, href)
+                if match_url in seen:
+                    continue
+                seen.add(match_url)
+                surrounding = self._schedule._container_text(anchor)
+                if not self._mentions(surrounding, opponent_team):
+                    continue
+                match_date = self._schedule._row_date(surrounding, match_url)
+                if match_date is None or match_date > today:
+                    continue
+                candidates.append((match_date, match_url, surrounding))
+            return candidates
+
+        candidates = extract_candidates(page)
+        if (not candidates and page.source != "Playwright"
+                and USE_PLAYWRIGHT_FALLBACK):
+            logger.info("静的HTMLから過去試合を特定できないため、Playwrightで日程を再取得します")
+            rendered = self.fetcher.fetch(
+                url, use_playwright_fallback=True,
+                wait_selector="a[href*='/match/']", force_render=True,
+            )
+            if rendered is not None and rendered.soup is not None:
+                candidates = extract_candidates(rendered)
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        found = [(match_url, row_text) for _, match_url, row_text in
+                 candidates[:HIGHLIGHT_MAX_MATCHES]]
         if not found:
             self._warn("%s の直近試合が日程・結果に見つかりませんでした", opponent_team)
         return found
@@ -1716,9 +1779,16 @@ def fetch_previous_highlight(
     league = search_league_hint(opponent_team) or "j1"
     network = build_network_config()
     lookup = JLeagueHighlightLookup(PageFetcher(build_session(network), network, report), report)
-    exclude = [JLEAGUE_MATCH_INFO.url] if JLEAGUE_MATCH_INFO is not None else []
-    if MATCH_PAGE_URL:
-        exclude.append(MATCH_PAGE_URL)
+    exclude: List[str] = []
+    # Colab版ではグローバルに試合情報を持つが、ローカルGUIではその名前自体が
+    # 定義されない。globals().get で両方の実行方式を扱い、NameErrorを避ける。
+    current_info = globals().get("JLEAGUE_MATCH_INFO")
+    current_url = str(getattr(current_info, "url", "") or "").strip()
+    if current_url:
+        exclude.append(current_url)
+    configured_url = str(globals().get("MATCH_PAGE_URL", "") or "").strip()
+    if configured_url:
+        exclude.append(configured_url)
     return lookup.find(opponent_team, league, season, exclude_urls=exclude)
 
 

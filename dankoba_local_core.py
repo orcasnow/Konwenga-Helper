@@ -1882,8 +1882,18 @@ class JLeagueStandings:
         return -1
 
     def _club_name(self, cell) -> str:
-        """「ＦＣ町田ゼルビア町田」のように正式名称と短縮名が続くのでほどく。"""
+        """クラブリンクの識別子から正式名を引き、表示名の連結に依存しない。"""
         anchor = cell.find("a")
+        if anchor:
+            href = str(anchor.get("href", ""))
+            slug_match = re.search(r"/club/([a-z0-9-]+)/?$", href, re.IGNORECASE)
+            if slug_match:
+                slug = slug_match.group(1).casefold()
+                for canonical, node in J_LEAGUE_CLUBS.items():
+                    if str(node.get("jleague_club_slug", "")).casefold() == slug:
+                        return canonical
+
+        # クラブ情報にない識別子だった場合は、表示文字列から従来どおり取得する。
         text = (anchor or cell).get_text(" ", strip=True)
         fragments = [part for part in re.split(r"[\s　]+", text) if part]
         return JLeagueScheduleLookup._dedupe_repeated_name(fragments[0]) if fragments else ""

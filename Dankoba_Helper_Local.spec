@@ -2,6 +2,8 @@
 """One-file Windows build; Chromium is bundled under pw-browsers."""
 
 import os
+import sys
+import sysconfig
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -20,15 +22,60 @@ if BROWSER_ROOT is None or not BROWSER_ROOT.is_dir():
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
 datas = playwright_datas + [(str(BROWSER_ROOT), "pw-browsers")]
 
+# Some per-user Python installations have working tkinter modules but PyInstaller
+# cannot initialize Tcl while probing it. Collect the standard Windows Tcl/Tk
+# files explicitly so the GUI is still available in that case.
+TCL_ROOT = Path(sys.base_prefix) / "tcl"
+try:
+    import _tkinter
+
+    TCL_VERSION = _tkinter.TCL_VERSION
+    TK_VERSION = _tkinter.TK_VERSION
+except (ImportError, AttributeError):
+    # Fall back to the pre-3.15 Windows layout if Tcl/Tk cannot be queried.
+    TCL_VERSION = TK_VERSION = "8.6"
+
+TCL_DATA = TCL_ROOT / f"tcl{TCL_VERSION}"
+TK_DATA = TCL_ROOT / f"tk{TK_VERSION}"
+TCL_MODULES = TCL_ROOT / f"tcl{TCL_VERSION.split('.')[0]}"
+for source, destination in (
+    (TCL_DATA, "_tcl_data"),
+    (TK_DATA, "_tk_data"),
+    (TCL_MODULES, f"tcl{TCL_VERSION.split('.')[0]}"),
+):
+    if source.is_dir():
+        datas.extend(
+            (
+                str(path),
+                (Path(destination) / path.relative_to(source).parent).as_posix(),
+            )
+            for path in source.rglob("*")
+            if path.is_file()
+        )
+
+tkinter_runtime_hook = (
+    Path(sysconfig.get_paths()["purelib"])
+    / "PyInstaller"
+    / "hooks"
+    / "rthooks"
+    / "pyi_rth__tkinter.py"
+)
+
 a = Analysis(
     [str(ROOT / "Dankoba_Helper_Local.py")],
     pathex=[str(ROOT)],
     binaries=playwright_binaries,
     datas=datas,
-    hiddenimports=playwright_hiddenimports,
-    hookspath=[],
+    hiddenimports=playwright_hiddenimports + [
+        "tkinter",
+        "_tkinter",
+        "tkinter.filedialog",
+        "tkinter.messagebox",
+        "tkinter.ttk",
+    ],
+    hookspath=[str(ROOT / "build_hooks")],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(tkinter_runtime_hook)] if tkinter_runtime_hook.is_file() else [],
     excludes=[],
     noarchive=False,
     optimize=0,

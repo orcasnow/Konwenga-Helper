@@ -4,19 +4,19 @@ Colab 版から独立して動く、Windows 向けのローカル GUI（Ver.2.0�
 
 ## 起動
 
-Python 3.10 以降を用意し、プロジェクトフォルダーで次を実行します。
+64-bit版 Python 3.15 と Windows の `py` ランチャーを用意し、プロジェクトフォルダーで次を実行します。
 
 ```powershell
-python -m pip install -r requirements-local.txt
-python -m playwright install chromium
-python Dankoba_Helper_Local.py
+py -3.15 -m pip install --upgrade -r requirements-local.txt
+py -3.15 -m playwright install chromium
+py -3.15 Dankoba_Helper_Local.py
 ```
 
-Windows では `run_local_app.bat` をダブルクリックして起動できます。画面には Python 標準の Tkinter を使い、`requirements-local.txt` のパッケージはローカル処理モジュールの読み込みと公式サイト取得に使います。Google API や外部サービスの認証は不要です。
+Windows では `run_local_app.bat` をダブルクリックして起動できます。このバッチは Python 3.15 を選択し、依存パッケージと Playwright 用 Chromium を更新してからアプリを起動します。画面には Python 標準の Tkinter を使い、`requirements-local.txt` のパッケージはローカル処理モジュールの読み込みと公式サイト取得に使います。Google API や外部サービスの認証は不要です。
 
 ### Windows用の単体実行ファイルを作る
 
-Windows上でプロジェクトの `build_windows_exe.bat` を実行してください。必要なPythonパッケージ、PyInstaller、Playwright用Chromiumを準備して、`dist\Dankoba_Helper_Local.exe` を作成します。初回ビルドにはネット接続と十分な作業用空き容量が必要です。
+Windows上でプロジェクトの `build_windows_exe.bat` を実行してください。Python 3.15環境にPython 3.15対応のPyInstallerと必要なPythonパッケージを入れ、Playwright用Chromiumを準備してから `dist\Dankoba_Helper_Local.exe` を作成します。初回ビルドにはネット接続と十分な作業用空き容量が必要です。
 
 作成したEXEは別のWindows PCへコピーして起動できます。利用側にPython、pip、Playwrightのインストールは不要です。実行ファイルにはChromiumを含むためサイズが大きく、起動時に同梱ファイルを一時フォルダーへ展開します。実行時の公式サイト情報取得にはインターネット接続が必要です。
 
